@@ -1,0 +1,130 @@
+import numpy as np
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL']='3'
+import tensorflow as tf  #TF 1.1.0rc1
+tf.logging.set_verbosity(tf.logging.ERROR)
+
+from tensorflow.python.framework import ops
+from tensorflow.python.ops import clip_ops
+from tensorflow.contrib.rnn import LSTMCell
+from tensorflow.contrib.rnn.python.ops import core_rnn
+
+
+
+
+
+IRIS_TEST = "ChlorineConcentration_TEST.csv"
+
+
+
+
+test_set=tf.contrib.learn.datasets.base.load_csv_with_header(
+	filename=IRIS_TEST,
+	target_dtype=np.int,
+	features_dtype=np.float32,
+	target_column=-1)
+
+N_FEATURES=166
+
+def batch_generator(filenames):
+	filename_queue=tf.train.string_input_producer(filenames)
+	reader=tf.TextLineReader(skip_header_lines=0)
+	_,value=reader.read(filename_queue)
+	record_defaults=[[1.0] for _ in range(N_FEATURES)]
+	record_defaults.append([1])
+	content=tf.decode_csv(value, record_defaults=record_defaults)
+	features=tf.stack(content[:N_FEATURES])
+	label=content[-1]
+	min_after_dequeue=10*batch_size #10
+	capacity=20*batch_size          #20
+	data_batch, label_batch = tf.train.shuffle_batch([features, label], batch_size=batch_size, capacity=capacity, min_after_dequeue=min_after_dequeue)
+	return data_batch, label_batch
+
+batch_size = 30 #30
+max_iterations = 3000
+dropout = 0.8
+
+num_layers = 3
+hidden_size = 120
+max_grad_norm = 5
+
+learning_rate = .005
+
+num_classes = 3
+
+
+X = tf.placeholder(tf.float32, [None, N_FEATURES], name = 'input_data')
+Y_ = tf.placeholder(tf.float32, [None,3], name='labels_data')  #INT64
+keep_prob = tf.placeholder("float", name = 'Drop_out_keep_prob')
+
+
+with tf.name_scope("LSTM_setup") as scope:
+  def single_cell():
+    return tf.contrib.rnn.DropoutWrapper(LSTMCell(hidden_size),output_keep_prob=keep_prob)
+  cell = tf.contrib.rnn.MultiRNNCell([single_cell() for _ in range(num_layers)])
+  initial_state = cell.zero_state(batch_size, tf.float32)
+    
+input_list = tf.unstack(tf.expand_dims(X,axis=2),axis=1)
+outputs,_ = core_rnn.static_rnn(cell, input_list, dtype=tf.float32)
+
+output = outputs[-1]
+
+
+
+with tf.name_scope("Softmax") as scope:
+  with tf.variable_scope("Softmax_params"):
+    softmax_w = tf.get_variable("softmax_w", [hidden_size, num_classes])
+    softmax_b = tf.get_variable("softmax_b", [num_classes])
+  logits = tf.nn.xw_plus_b(output, softmax_w, softmax_b)
+  Y=tf.nn.softmax(logits)
+  loss = tf.nn.softmax_cross_entropy_with_logits(logits=logits,labels=Y_,name = 'softmax') #SPARSE
+  cost = tf.reduce_sum(loss) / batch_size
+
+with tf.name_scope("Evaluating_accuracy") as scope:
+  correct_prediction = tf.equal(tf.argmax(logits,1),tf.argmax(Y_,1))
+  accuracy = tf.reduce_mean(tf.cast(correct_prediction, "float"))
+  h1 = tf.summary.scalar('accuracy',accuracy)
+  h2 = tf.summary.scalar('cost', cost)
+
+
+with tf.name_scope("Optimizer") as scope:
+  tvars = tf.trainable_variables()
+  grads, _ = tf.clip_by_global_norm(tf.gradients(cost, tvars),max_grad_norm)   #We clip the gradients to prevent explosion
+  optimizer = tf.train.AdamOptimizer(learning_rate)
+  gradients = zip(grads, tvars)
+  train_op = optimizer.apply_gradients(gradients)
+
+
+merged = tf.summary.merge_all()
+
+
+
+cost_train_ma = -np.log(1/float(num_classes)+1e-9)  #Moving average training cost
+acc_train_ma = 0.0
+
+data_batch, label_batch = batch_generator(["ChlorineConcentration_TRAIN.csv"])
+
+init = tf.global_variables_initializer() 
+
+
+with tf.Session() as sess:
+	sess.run(init)
+	coord=tf.train.Coordinator()
+	threads=tf.train.start_queue_runners(coord=coord)
+	for i in range(3000):  #3000
+    		features, labels = sess.run([data_batch, label_batch])
+    		b=np.zeros((batch_size,3))
+    		b[np.arange(batch_size), labels]=1
+    		if i%200 == 0:
+      			#Check training performance
+      			train_accuracy = accuracy.eval(feed_dict = { X: features, Y_: b, keep_prob: 1.0})
+      			print("step %d, training accuracy %g"%(i, train_accuracy))
+    		cost_train, acc_train,_ = sess.run([cost,accuracy,train_op],feed_dict = {X: features, Y_: b, keep_prob:dropout})
+    		cost_train_ma = cost_train_ma*0.99 + cost_train*0.01
+    		acc_train_ma = acc_train_ma*0.99 + acc_train*0.01
+	coord.request_stop()
+	coord.join(threads)
+	probabilities=Y
+	print ("probabilities", probabilities.eval(feed_dict={X: test_set.data, keep_prob: 1.0}))
+	np.savetxt('resultLSTM.txt', probabilities.eval(feed_dict={X: test_set.data, keep_prob: 1.0}), delimiter=',')
+	
